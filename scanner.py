@@ -1,8 +1,9 @@
 """
 Scanner agent: for one tracked token, pull recent swap transactions from
-Helius, store the normalized swap rows, then recompute wallet P&L for that
-token. Designed to be called per-token from the dashboard's "Scan now"
-button, or looped over all tracked tokens on a schedule.
+Solana (via Helius RPC), store the normalized swap rows, then recompute
+wallet P&L for that token. Designed to be called per-token from the
+dashboard's "Scan now" button, or looped over all tracked tokens on a
+schedule.
 """
 
 from config import TX_PAGE_LIMIT
@@ -10,26 +11,41 @@ import db
 import helius_client
 import pnl
 
+# How many getTransaction calls go in a single JSON-RPC batch request.
+BATCH_SIZE = 50
+
 
 def scan_token(mint: str, max_pages: int = 3) -> dict:
     """
-    Pulls up to max_pages * TX_PAGE_LIMIT recent transactions for `mint`,
-    stores parsed swaps, recomputes P&L. Returns a small summary dict.
+    Pulls up to max_pages * TX_PAGE_LIMIT recent signatures for `mint`,
+    fetches full transactions in batches, extracts swap rows by balance
+    diffing, stores them, recomputes P&L. Returns a small summary dict.
     """
     all_rows = []
+    failed_txs = 0
     before = None
 
     for _ in range(max_pages):
-        txs = helius_client.get_token_transactions(mint, before=before, limit=TX_PAGE_LIMIT)
-        if not txs:
+        sig_entries = helius_client.get_signatures_for_mint(mint, before=before, limit=TX_PAGE_LIMIT)
+        if not sig_entries:
             break
 
-        rows = helius_client.parse_swaps_for_token(txs, mint)
-        all_rows.extend(rows)
+        # Skip signatures for transactions that failed on-chain (nothing to score).
+        signatures = [e["signature"] for e in sig_entries if not e.get("err")]
 
-        if len(txs) < TX_PAGE_LIMIT:
+        for i in range(0, len(signatures), BATCH_SIZE):
+            batch = signatures[i : i + BATCH_SIZE]
+            tx_map = helius_client.get_transactions_batch(batch)
+            for sig in batch:
+                tx = tx_map.get(sig)
+                if tx is None:
+                    failed_txs += 1
+                    continue
+                all_rows.extend(helius_client.extract_swap_rows(tx, mint))
+
+        if len(sig_entries) < TX_PAGE_LIMIT:
             break
-        before = txs[-1].get("signature")
+        before = sig_entries[-1].get("signature")
 
     db.insert_swaps(all_rows)
     db.mark_scanned(mint)
@@ -42,6 +58,7 @@ def scan_token(mint: str, max_pages: int = 3) -> dict:
         "mint": mint,
         "swaps_fetched": len(all_rows),
         "wallets_scored": len(pnl_rows),
+        "tx_fetch_failures": failed_txs,
     }
 
 

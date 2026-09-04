@@ -1,25 +1,27 @@
 """
-Thin wrapper around Helius's Enhanced Transactions API.
+Solana RPC client (via Helius's RPC endpoint) for pulling swap activity for a
+token mint.
 
-Docs: https://docs.helius.dev/solana-apis/enhanced-transactions-api
+Why not the Enhanced Transactions API (v0/addresses/.../transactions)?
+Helius has moved that product to maintenance mode, and by their own docs it
+only reliably classifies transactions as `type: "SWAP"` for NFT/Jupiter/SPL
+activity. Tokens that trade on their own program before migrating to an AMM
+-- e.g. pump.fun bonding-curve trades -- often never get tagged SWAP at all,
+so filtering on that field silently returns zero rows for exactly those
+tokens.
 
-We pull parsed transactions for a token mint address. Helius already decodes
-DEX swaps (Raydium/Pump.fun/Jupiter/Orca/etc.) into a `type: "SWAP"` shape
-with `tokenTransfers` and `nativeTransfers`, so we don't have to hand-decode
-instruction data ourselves.
-
-NOTE: swap parsing below is heuristic. Multi-hop routed swaps (e.g. through
-Jupiter) can involve several intermediate transfers in one transaction; this
-takes the transfer(s) that touch the tracked mint and the SOL/wSOL leg of the
-same transaction as the trade's price. Good enough for wallet-level P&L
-ranking; not meant to be exact tax-grade accounting.
+Instead, this pulls raw transactions and detects trades by diffing each
+wallet's token balance and native SOL balance from before -> after the
+transaction (pre/postTokenBalances, pre/postBalances). This works regardless
+of which program executed the trade, since any wallet that ends up with more
+or less of the tracked token, and a corresponding SOL change, was trading it.
 """
 
 import requests
 
-from config import HELIUS_API_KEY, HELIUS_BASE_URL, SOL_MINT, TX_PAGE_LIMIT
+from config import HELIUS_API_KEY, HELIUS_RPC_URL
 
-WSOL_MINT = SOL_MINT
+LAMPORTS_PER_SOL = 1_000_000_000
 
 
 class HeliusError(Exception):
@@ -30,81 +32,141 @@ def _require_key():
     if not HELIUS_API_KEY:
         raise HeliusError(
             "HELIUS_API_KEY is not set. Get a free key at https://dashboard.helius.dev "
-            "and set it as an environment variable before running."
+            "and set it as an environment variable (or Streamlit secret)."
         )
 
 
-def get_token_transactions(mint: str, before: str | None = None, limit: int = TX_PAGE_LIMIT):
-    """Fetch recent parsed transactions that touched this token mint address."""
+def get_signatures_for_mint(mint: str, before: str | None = None, limit: int = 100) -> list[dict]:
+    """Recent transaction signatures that touched this token mint address."""
     _require_key()
-    url = f"{HELIUS_BASE_URL}/addresses/{mint}/transactions"
-    params = {"api-key": HELIUS_API_KEY, "limit": limit}
+    params = {"limit": limit}
     if before:
         params["before"] = before
 
-    resp = requests.get(url, params=params, timeout=30)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignaturesForAddress",
+        "params": [mint, params],
+    }
+    resp = requests.post(HELIUS_RPC_URL, json=payload, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    if "error" in data:
+        raise HeliusError(f"RPC error on getSignaturesForAddress: {data['error']}")
+    return data.get("result", []) or []
 
 
-def parse_swaps_for_token(transactions: list[dict], token_mint: str) -> list[dict]:
+def get_transactions_batch(signatures: list[str]) -> dict:
     """
-    Turn Helius enhanced transactions into normalized swap rows:
+    Fetch full parsed transactions for a batch of signatures in one HTTP
+    round trip (JSON-RPC batch request). Returns {signature: parsed_tx_or_None}.
+    """
+    _require_key()
+    if not signatures:
+        return {}
+
+    payload = [
+        {
+            "jsonrpc": "2.0",
+            "id": i,
+            "method": "getTransaction",
+            "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+        }
+        for i, sig in enumerate(signatures)
+    ]
+    resp = requests.post(HELIUS_RPC_URL, json=payload, timeout=60)
+    resp.raise_for_status()
+    results = resp.json()
+
+    out = {}
+    for r in results:
+        idx = r.get("id")
+        if idx is None or not (0 <= idx < len(signatures)):
+            continue
+        out[signatures[idx]] = r.get("result") if "error" not in r else None
+    return out
+
+
+def extract_swap_rows(tx: dict, token_mint: str) -> list[dict]:
+    """
+    Diff a parsed transaction's token + SOL balances to detect trades of
+    `token_mint`. Returns normalized rows:
     {signature, token_mint, wallet, side, token_amount, sol_amount, block_time}
     """
+    if not tx:
+        return []
+
+    meta = tx.get("meta") or {}
+    if meta.get("err") is not None:
+        return []  # skip failed transactions
+
+    message = (tx.get("transaction") or {}).get("message") or {}
+    account_keys_raw = message.get("accountKeys", [])
+    account_keys = [
+        k.get("pubkey") if isinstance(k, dict) else k for k in account_keys_raw
+    ]
+    if not account_keys:
+        return []
+
+    fee = meta.get("fee", 0)
+    fee_payer = account_keys[0]
+    block_time = tx.get("blockTime")
+    signatures = (tx.get("transaction") or {}).get("signatures", [])
+    signature = signatures[0] if signatures else None
+
+    pre_token = {
+        (b["owner"], b["mint"]): (b.get("uiTokenAmount") or {}).get("uiAmount") or 0
+        for b in meta.get("preTokenBalances", []) or []
+        if b.get("owner")
+    }
+    post_token = {
+        (b["owner"], b["mint"]): (b.get("uiTokenAmount") or {}).get("uiAmount") or 0
+        for b in meta.get("postTokenBalances", []) or []
+        if b.get("owner")
+    }
+
+    pre_balances = meta.get("preBalances", []) or []
+    post_balances = meta.get("postBalances", []) or []
+    pre_lamports = {account_keys[i]: lam for i, lam in enumerate(pre_balances) if i < len(account_keys)}
+    post_lamports = {account_keys[i]: lam for i, lam in enumerate(post_balances) if i < len(account_keys)}
+
+    owners = {o for (o, m) in pre_token if m == token_mint} | {o for (o, m) in post_token if m == token_mint}
+
     rows = []
+    for owner in owners:
+        pre_amt = pre_token.get((owner, token_mint), 0)
+        post_amt = post_token.get((owner, token_mint), 0)
+        token_delta = post_amt - pre_amt
 
-    for tx in transactions:
-        if tx.get("type") != "SWAP":
+        if abs(token_delta) < 1e-9:
             continue
 
-        signature = tx.get("signature")
-        block_time = tx.get("timestamp")
-        token_transfers = tx.get("tokenTransfers", []) or []
-        native_transfers = tx.get("nativeTransfers", []) or []
-
-        # Isolate the leg(s) that move the tracked token
-        token_legs = [t for t in token_transfers if t.get("mint") == token_mint]
-        if not token_legs:
+        pre_lam = pre_lamports.get(owner)
+        post_lam = post_lamports.get(owner)
+        if pre_lam is None or post_lam is None:
             continue
 
-        # Total SOL that moved in this tx (native SOL + wrapped SOL transfers combined)
-        sol_moved = sum(t.get("amount", 0) for t in native_transfers)
-        wsol_legs = [t for t in token_transfers if t.get("mint") == WSOL_MINT]
-        sol_moved += sum(t.get("tokenAmount", 0) for t in wsol_legs)
+        lamports_delta = post_lam - pre_lam
+        if owner == fee_payer:
+            lamports_delta += fee  # exclude the tx fee from the trade's cost/proceeds
 
-        for leg in token_legs:
-            wallet = leg.get("toUserAccount") if leg.get("toUserAccount") else leg.get("fromUserAccount")
-            from_acct = leg.get("fromUserAccount")
-            to_acct = leg.get("toUserAccount")
-            token_amount = leg.get("tokenAmount", 0)
+        sol_amount = abs(lamports_delta) / LAMPORTS_PER_SOL
+        if sol_amount == 0:
+            continue  # a SOL-side change is required to call this a trade, not a transfer
 
-            # Heuristic: token flowing INTO a wallet from a pool/program = buy.
-            # Token flowing OUT of a wallet into a pool/program = sell.
-            # We treat the receiving account as the trader on a buy, and the
-            # sending account as the trader on a sell.
-            if to_acct:
-                side = "buy"
-                wallet = to_acct
-            elif from_acct:
-                side = "sell"
-                wallet = from_acct
-            else:
-                continue
+        side = "buy" if token_delta > 0 else "sell"
 
-            if not wallet or token_amount == 0:
-                continue
-
-            rows.append(
-                {
-                    "signature": signature,
-                    "token_mint": token_mint,
-                    "wallet": wallet,
-                    "side": side,
-                    "token_amount": abs(token_amount),
-                    "sol_amount": abs(sol_moved) if sol_moved else 0.0,
-                    "block_time": block_time,
-                }
-            )
+        rows.append(
+            {
+                "signature": signature,
+                "token_mint": token_mint,
+                "wallet": owner,
+                "side": side,
+                "token_amount": abs(token_delta),
+                "sol_amount": sol_amount,
+                "block_time": block_time,
+            }
+        )
 
     return rows
