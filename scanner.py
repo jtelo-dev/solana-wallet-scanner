@@ -69,4 +69,6 @@ def scan_all_tokens(max_pages: int = 3) -> list[dict]:
             summaries.append(scan_token(token["mint"], max_pages=max_pages))
         except helius_client.HeliusError as e:
             summaries.append({"mint": token["mint"], "error": str(e)})
+        except Exception as e:  # noqa: BLE001 - surface it in the UI instead of crashing the app
+            summaries.append({"mint": token["mint"], "error": f"Unexpected error: {e}"})
     return summaries

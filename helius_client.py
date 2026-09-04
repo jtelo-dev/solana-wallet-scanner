@@ -17,6 +17,8 @@ of which program executed the trade, since any wallet that ends up with more
 or less of the tracked token, and a corresponding SOL change, was trading it.
 """
 
+import time
+
 import requests
 
 from config import HELIUS_API_KEY, HELIUS_RPC_URL
@@ -36,6 +38,30 @@ def _require_key():
         )
 
 
+def _post_rpc(payload: dict, timeout: int = 30, retries: int = 2) -> dict:
+    """
+    POST a single JSON-RPC request and surface the *real* failure reason
+    (status code + response body) instead of a generic HTTPError, so it's
+    visible in the Streamlit UI instead of getting redacted. Retries once on
+    HTTP 429 (rate limited) with a short backoff.
+    """
+    last_error = None
+    for attempt in range(retries + 1):
+        resp = requests.post(HELIUS_RPC_URL, json=payload, timeout=timeout)
+        if resp.status_code == 429 and attempt < retries:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        if not resp.ok:
+            raise HeliusError(
+                f"Helius RPC request failed — HTTP {resp.status_code}: {resp.text[:400]}"
+            )
+        data = resp.json()
+        if isinstance(data, dict) and "error" in data:
+            raise HeliusError(f"Helius RPC error: {data['error']}")
+        return data
+    raise HeliusError(f"Helius RPC request failed after retries: {last_error}")
+
+
 def get_signatures_for_mint(mint: str, before: str | None = None, limit: int = 100) -> list[dict]:
     """Recent transaction signatures that touched this token mint address."""
     _require_key()
@@ -49,42 +75,39 @@ def get_signatures_for_mint(mint: str, before: str | None = None, limit: int = 1
         "method": "getSignaturesForAddress",
         "params": [mint, params],
     }
-    resp = requests.post(HELIUS_RPC_URL, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise HeliusError(f"RPC error on getSignaturesForAddress: {data['error']}")
+    data = _post_rpc(payload)
     return data.get("result", []) or []
+
+
+def get_transaction(signature: str) -> dict | None:
+    """Fetch one full parsed transaction by signature."""
+    _require_key()
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+    }
+    data = _post_rpc(payload)
+    return data.get("result")
 
 
 def get_transactions_batch(signatures: list[str]) -> dict:
     """
-    Fetch full parsed transactions for a batch of signatures in one HTTP
-    round trip (JSON-RPC batch request). Returns {signature: parsed_tx_or_None}.
+    Fetch full parsed transactions for a list of signatures. Despite the
+    name, this issues individual requests rather than a JSON-RPC batch —
+    Helius's shared/free RPC tier rejects batched requests outright, which
+    is exactly the error this replaced. Individual calls are slightly slower
+    but far more reliable. A single signature's failure doesn't abort the
+    rest of the scan; it's just skipped and counted as a failure.
+    Returns {signature: parsed_tx_or_None}.
     """
-    _require_key()
-    if not signatures:
-        return {}
-
-    payload = [
-        {
-            "jsonrpc": "2.0",
-            "id": i,
-            "method": "getTransaction",
-            "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-        }
-        for i, sig in enumerate(signatures)
-    ]
-    resp = requests.post(HELIUS_RPC_URL, json=payload, timeout=60)
-    resp.raise_for_status()
-    results = resp.json()
-
     out = {}
-    for r in results:
-        idx = r.get("id")
-        if idx is None or not (0 <= idx < len(signatures)):
-            continue
-        out[signatures[idx]] = r.get("result") if "error" not in r else None
+    for sig in signatures:
+        try:
+            out[sig] = get_transaction(sig)
+        except HeliusError:
+            out[sig] = None
     return out
 
 
